@@ -1,0 +1,72 @@
+# Database Optimisation Enhancement: Local DB Infrastructure
+# Service: inventory
+# Usage: docker-compose -f database/docker-compose-db.yml up -d
+version: '3.8'
+services:
+
+  redis:
+    image: redis:7.2-alpine
+    container_name: redis-inventory
+    ports:
+      - "6379:6379"
+    command: redis-server --maxmemory 256mb --maxmemory-policy allkeys-lru --save 60 1
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    networks:
+      - db-network
+
+  redis-commander:
+    image: rediscommander/redis-commander:latest
+    container_name: redis-ui-inventory
+    ports:
+      - "8081:8081"
+    environment:
+      REDIS_HOSTS: local:redis:6379
+    depends_on:
+      - redis
+    networks:
+      - db-network
+
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.12.0
+    container_name: es-inventory
+    environment:
+      - discovery.type=single-node
+      - ES_JAVA_OPTS=-Xms512m -Xmx512m
+      - xpack.security.enabled=false
+    ports:
+      - "9200:9200"
+    volumes:
+      - es_data:/usr/share/elasticsearch/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -s http://localhost:9200/_cluster/health | grep -v red"]
+      interval: 20s
+      timeout: 10s
+      retries: 5
+    networks:
+      - db-network
+
+  kibana:
+    image: docker.elastic.co/kibana/kibana:8.12.0
+    container_name: kibana-inventory
+    ports:
+      - "5601:5601"
+    environment:
+      ELASTICSEARCH_HOSTS: http://es-inventory:9200
+    depends_on:
+      - elasticsearch
+    networks:
+      - db-network
+
+volumes:
+  redis_data:
+  es_data:
+
+networks:
+  db-network:
+    driver: bridge
