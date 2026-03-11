@@ -1,0 +1,79 @@
+# Monitoring Enhancement: Prometheus Alert Rules for inventory
+# Deploy to AlertManager alongside Prometheus scrape config.
+groups:
+  - name: inventory_alerts
+    interval: 30s
+    rules:
+
+      # ── High Error Rate ──────────────────────────────────────────────────────
+      - alert: HighErrorRate_inventory
+        expr: |
+          rate(inventory_errors_total{service="inventory"}[5m]) > 0.1
+        for: 2m
+        labels:
+          severity: warning
+          service: inventory
+        annotations:
+          summary: "High error rate on {{ $labels.service }}"
+          description: "Error rate is {{ $value | humanizePercentage }} on inventory"
+
+      # ── High HTTP Latency ────────────────────────────────────────────────────
+      - alert: HighLatency_inventory
+        expr: |
+          histogram_quantile(0.95, rate(http_server_requests_seconds_bucket{service="inventory"}[5m])) > 2
+        for: 5m
+        labels:
+          severity: warning
+          service: inventory
+        annotations:
+          summary: "p95 latency above 2s on inventory"
+          description: "p95 latency is {{ $value }}s on inventory"
+
+      # ── Service Down ─────────────────────────────────────────────────────────
+      - alert: ServiceDown_inventory
+        expr: |
+          up{job="inventory"} == 0
+        for: 1m
+        labels:
+          severity: critical
+          service: inventory
+        annotations:
+          summary: "inventory is DOWN"
+          description: "inventory Prometheus target is not reachable"
+
+      # ── High Heap Memory ─────────────────────────────────────────────────────
+      - alert: HighHeapMemory_inventory
+        expr: |
+          (jvm_memory_used_bytes{service="inventory",area="heap"} /
+           jvm_memory_max_bytes{service="inventory",area="heap"}) > 0.85
+        for: 5m
+        labels:
+          severity: warning
+          service: inventory
+        annotations:
+          summary: "JVM Heap above 85% on inventory"
+          description: "Heap usage is {{ $value | humanizePercentage }} on inventory"
+
+      # ── Too Many 5xx Responses ───────────────────────────────────────────────
+      - alert: High5xxRate_inventory
+        expr: |
+          rate(http_server_requests_seconds_count{service="inventory",status=~"5.."}[5m]) > 0.05
+        for: 2m
+        labels:
+          severity: critical
+          service: inventory
+        annotations:
+          summary: "High 5xx rate on inventory"
+          description: "5xx rate is {{ $value | humanize }} req/s on inventory"
+
+      # ── High CPU Usage ───────────────────────────────────────────────────────
+      - alert: HighCpuUsage_inventory
+        expr: |
+          process_cpu_usage{service="inventory"} > 0.80
+        for: 5m
+        labels:
+          severity: warning
+          service: inventory
+        annotations:
+          summary: "CPU above 80% on inventory"
+          description: "CPU usage is {{ $value | humanizePercentage }} on inventory"
