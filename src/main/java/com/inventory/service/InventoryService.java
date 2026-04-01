@@ -1,158 +1,84 @@
 package com.inventory.service;
-
 import com.inventory.dto.*;
 import com.inventory.entity.*;
+import com.inventory.exception.InventoryException;
 import com.inventory.kafka.InventoryEventProducer;
 import com.inventory.repository.*;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
-import org.springframework.beans.factory.annotation.Value;
+import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
-import java.util.List;
+import java.time.LocalDateTime;
+import java.util.*;
 import java.util.stream.Collectors;
-
-@Service
-@RequiredArgsConstructor
-@Slf4j
+@Service @RequiredArgsConstructor @Slf4j
 public class InventoryService {
+    private final InventoryItemRepository itemRepo;
+    private final InventoryReservationRepository reservationRepo;
+    private final InventoryEventProducer producer;
 
-    private final InventoryRepository inventoryRepo;
-    private final StockReservationRepository reservationRepo;
-    private final InventoryEventProducer eventProducer;
-
-    @Value("${inventory.low.stock.threshold:10}")
-    private int defaultLowStockThreshold;
-
-    // ── Create inventory item ─────────────────────────────────────────────────
     @Transactional
-    public InventoryResponse addProduct(InventoryRequest req) {
-        log.info("Adding product to inventory: {}", req.getProductId());
-        InventoryItem item = InventoryItem.builder()
-                .productId(req.getProductId())
-                .productName(req.getProductName())
-                .availableQuantity(req.getQuantity())
-                .reservedQuantity(0)
-                .lowStockThreshold(req.getLowStockThreshold() > 0 ? req.getLowStockThreshold() : defaultLowStockThreshold)
-                .warehouseLocation(req.getWarehouseLocation())
-                .sku(req.getSku())
+    public CheckAndReserveResponse checkAndReserve(CheckAndReserveRequest req) {
+        List<String> outOfStock = new ArrayList<>();
+        for (CheckAndReserveRequest.Item item : req.getItems()) {
+            InventoryItem inv = itemRepo.findByProductId(item.getProductId())
+                .orElseThrow(() -> new InventoryException("Product not found: " + item.getProductId()));
+            if (inv.getAvailableQty() < item.getRequiredQty()) {
+                outOfStock.add(item.getProductId());
+            }
+        }
+        if (!outOfStock.isEmpty()) {
+            return CheckAndReserveResponse.builder().allAvailable(false).outOfStockProducts(outOfStock).build();
+        }
+        String reservationId = "RES-" + UUID.randomUUID().toString().substring(0, 8).toUpperCase();
+        for (CheckAndReserveRequest.Item item : req.getItems()) {
+            InventoryItem inv = itemRepo.findByProductId(item.getProductId()).get();
+            inv.setAvailableQty(inv.getAvailableQty() - item.getRequiredQty());
+            inv.setReservedQty(inv.getReservedQty() + item.getRequiredQty());
+            inv.setUpdatedAt(LocalDateTime.now());
+            itemRepo.save(inv);
+            InventoryReservation res = InventoryReservation.builder()
+                .reservationId(reservationId + "-" + item.getProductId())
+                .productId(item.getProductId()).reservedQty(item.getRequiredQty())
+                .status(InventoryReservation.ReservationStatus.ACTIVE)
+                .createdAt(LocalDateTime.now())
+                .expiresAt(LocalDateTime.now().plusMinutes(30))
                 .build();
-        item = inventoryRepo.save(item);
-        eventProducer.publishInventoryUpdated(item.getProductId(), item.getAvailableQuantity(), "Initial stock");
-        return toResponse(item);
-    }
-
-    // ── Check availability ────────────────────────────────────────────────────
-    public boolean isAvailable(String productId, int quantity) {
-        return inventoryRepo.findByProductId(productId)
-                .map(i -> i.getAvailableQuantity() >= quantity)
-                .orElse(false);
-    }
-
-    // ── Reserve stock for an order ────────────────────────────────────────────
-    @Transactional
-    public InventoryResponse reserveStock(ReserveRequest req) {
-        log.info("Reserving {} units of {} for orderId={}", req.getQuantity(), req.getProductId(), req.getOrderId());
-        InventoryItem item = inventoryRepo.findByProductId(req.getProductId())
-                .orElseThrow(() -> new RuntimeException("Product not found: " + req.getProductId()));
-
-        if (item.getAvailableQuantity() < req.getQuantity()) {
-            throw new RuntimeException("Insufficient stock for product: " + req.getProductId()
-                + " — available: " + item.getAvailableQuantity() + ", requested: " + req.getQuantity());
+            reservationRepo.save(res);
+            if (inv.getAvailableQty() <= inv.getLowStockThreshold()) {
+                producer.publishLowStock(inv);
+            }
         }
-
-        item.setAvailableQuantity(item.getAvailableQuantity() - req.getQuantity());
-        item.setReservedQuantity(item.getReservedQuantity() + req.getQuantity());
-        item = inventoryRepo.save(item);
-
-        reservationRepo.save(StockReservation.builder()
-                .orderId(req.getOrderId())
-                .productId(req.getProductId())
-                .reservedQuantity(req.getQuantity())
-                .status(StockReservation.ReservationStatus.ACTIVE)
-                .build());
-
-        eventProducer.publishInventoryReserved(req.getOrderId(), req.getProductId(), req.getQuantity());
-
-        if (item.isLowStock()) {
-            eventProducer.publishLowStockAlert(item.getProductId(), item.getProductName(), item.getAvailableQuantity());
-        }
-        return toResponse(item);
+        producer.publishReserved(reservationId, req.getItems());
+        log.info("Reserved inventory reservationId={}", reservationId);
+        return CheckAndReserveResponse.builder().allAvailable(true).reservationId(reservationId).build();
     }
 
-    // ── Confirm reservation (order confirmed) ─────────────────────────────────
     @Transactional
-    public void confirmReservation(String orderId) {
-        reservationRepo.findByOrderId(orderId).forEach(r -> {
-            r.setStatus(StockReservation.ReservationStatus.CONFIRMED);
-            reservationRepo.save(r);
-            log.info("Reservation confirmed for orderId={} productId={}", orderId, r.getProductId());
-        });
+    public void updateStock(StockUpdateRequest req) {
+        InventoryItem inv = itemRepo.findByProductId(req.getProductId())
+            .orElseThrow(() -> new InventoryException("Product not found: " + req.getProductId()));
+        inv.setAvailableQty(req.getNewQuantity());
+        inv.setUpdatedAt(LocalDateTime.now());
+        itemRepo.save(inv);
+        producer.publishStockUpdated(inv);
+        log.info("Stock updated productId={} qty={}", req.getProductId(), req.getNewQuantity());
     }
 
-    // ── Release reservation (order cancelled) ─────────────────────────────────
+    public List<InventoryItem> getLowStockItems() {
+        return itemRepo.findAll().stream()
+            .filter(i -> i.getAvailableQty() <= i.getLowStockThreshold())
+            .collect(Collectors.toList());
+    }
+
+    // Daily job — expire stale reservations
+    @Scheduled(cron = "0 0 2 * * *")
     @Transactional
-    public void releaseReservation(String orderId) {
-        reservationRepo.findByOrderId(orderId).forEach(r -> {
-            inventoryRepo.findByProductId(r.getProductId()).ifPresent(item -> {
-                item.setAvailableQuantity(item.getAvailableQuantity() + r.getReservedQuantity());
-                item.setReservedQuantity(Math.max(0, item.getReservedQuantity() - r.getReservedQuantity()));
-                inventoryRepo.save(item);
-            });
-            r.setStatus(StockReservation.ReservationStatus.RELEASED);
-            reservationRepo.save(r);
-            eventProducer.publishReservationReleased(orderId, r.getProductId(), r.getReservedQuantity());
-        });
-    }
-
-    // ── Deduct stock after payment ────────────────────────────────────────────
-    @Transactional
-    public void deductStockAfterPayment(String orderId) {
-        reservationRepo.findByOrderId(orderId).forEach(r -> {
-            inventoryRepo.findByProductId(r.getProductId()).ifPresent(item -> {
-                item.setReservedQuantity(Math.max(0, item.getReservedQuantity() - r.getReservedQuantity()));
-                inventoryRepo.save(item);
-                eventProducer.publishInventoryUpdated(item.getProductId(), item.getAvailableQuantity(), "Post-payment deduction");
-            });
-            r.setStatus(StockReservation.ReservationStatus.CONFIRMED);
-            reservationRepo.save(r);
-        });
-    }
-
-    // ── Update stock ──────────────────────────────────────────────────────────
-    @Transactional
-    public InventoryResponse updateStock(StockUpdateRequest req) {
-        InventoryItem item = inventoryRepo.findByProductId(req.getProductId())
-                .orElseThrow(() -> new RuntimeException("Product not found: " + req.getProductId()));
-        item.setAvailableQuantity(Math.max(0, item.getAvailableQuantity() + req.getQuantityChange()));
-        item = inventoryRepo.save(item);
-        eventProducer.publishInventoryUpdated(item.getProductId(), item.getAvailableQuantity(), req.getReason());
-        if (item.isLowStock()) {
-            eventProducer.publishLowStockAlert(item.getProductId(), item.getProductName(), item.getAvailableQuantity());
-        }
-        return toResponse(item);
-    }
-
-    public InventoryResponse getInventory(String productId) {
-        return inventoryRepo.findByProductId(productId).map(this::toResponse)
-                .orElseThrow(() -> new RuntimeException("Product not found: " + productId));
-    }
-
-    public List<InventoryResponse> getLowStockItems() {
-        return inventoryRepo.findByAvailableQuantityLessThanEqual(defaultLowStockThreshold)
-                .stream().map(this::toResponse).collect(Collectors.toList());
-    }
-
-    public List<InventoryResponse> getAllInventory() {
-        return inventoryRepo.findAll().stream().map(this::toResponse).collect(Collectors.toList());
-    }
-
-    private InventoryResponse toResponse(InventoryItem i) {
-        return InventoryResponse.builder()
-                .id(i.getId()).productId(i.getProductId()).productName(i.getProductName())
-                .availableQuantity(i.getAvailableQuantity()).reservedQuantity(i.getReservedQuantity())
-                .totalStock(i.getTotalStock()).lowStock(i.isLowStock())
-                .warehouseLocation(i.getWarehouseLocation()).sku(i.getSku())
-                .lastUpdated(i.getLastUpdated()).build();
+    public void expireOldReservations() {
+        reservationRepo.findByStatus(InventoryReservation.ReservationStatus.ACTIVE)
+            .stream().filter(r -> r.getExpiresAt().isBefore(LocalDateTime.now()))
+            .forEach(r -> { r.setStatus(InventoryReservation.ReservationStatus.EXPIRED); reservationRepo.save(r); });
+        log.info("Expired stale inventory reservations");
     }
 }
